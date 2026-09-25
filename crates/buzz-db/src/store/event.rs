@@ -75,6 +75,9 @@ pub struct EventQuery {
     pub authors: Option<Vec<Vec<u8>>>,
     /// Restrict results to events with any of these IDs (multi-id `IN` pushdown).
     pub ids: Option<Vec<Vec<u8>>>,
+    /// Restrict results to this lexicographic event-ID byte range (inclusive lower,
+    /// exclusive upper). The `(community_id, id, ...)` index serves prefix scans.
+    pub id_prefix_range: Option<(Vec<u8>, Option<Vec<u8>>)>,
     /// Restrict results to events with an `e` tag referencing any of these event IDs (hex).
     /// Uses JSONB containment (`tags @> ...`) against the `tags` column.
     pub e_tags: Option<Vec<String>>,
@@ -138,6 +141,7 @@ impl EventQuery {
             global_only: false,
             authors: None,
             ids: None,
+            id_prefix_range: None,
             e_tags: None,
             custom_tag: None,
             channel_ids: None,
@@ -488,6 +492,13 @@ pub(crate) async fn query_events_on(
     if q.ids.as_deref().is_some_and(|i| i.is_empty()) {
         return Ok(vec![]);
     }
+    if q.id_prefix_range.as_ref().is_some_and(|(lower, upper)| {
+        lower.len() != 32 || upper.as_ref().is_some_and(Vec::is_empty)
+    }) {
+        return Err(DbError::InvalidData(
+            "event ID prefix range must have a 32-byte lower bound".to_string(),
+        ));
+    }
     if q.e_tags.as_deref().is_some_and(|e| e.is_empty()) {
         return Ok(vec![]);
     }
@@ -593,6 +604,15 @@ pub(crate) async fn query_events_on(
                 sep.push_bind(id.clone());
             }
             qb.push(")");
+        }
+    }
+
+    if let Some((lower, upper)) = &q.id_prefix_range {
+        qb.push(format!(" AND {col_prefix}id >= "))
+            .push_bind(lower.clone());
+        if let Some(upper) = upper {
+            qb.push(format!(" AND {col_prefix}id < "))
+                .push_bind(upper.clone());
         }
     }
 
@@ -2763,6 +2783,131 @@ mod postgres_tests {
         assert_eq!(
             partial_authorization_count, 1,
             "partial authorization must exclude requested B, unrelated C, and global rows"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn event_id_prefix_range_is_recent_live_and_channel_scoped() {
+        let pool = setup_pool().await;
+        let community_uuid = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_uuid);
+        let accessible = make_test_channel(&pool, community_uuid, None).await;
+        let denied = make_test_channel(&pool, community_uuid, None).await;
+        let now = chrono::Utc::now().timestamp() as u64;
+        let fixed_prefix = [0x12, 0x34, 0x56, 0x78];
+
+        async fn insert_with_id(
+            pool: &PgPool,
+            community: CommunityId,
+            event: &nostr::Event,
+            channel: Option<Uuid>,
+            fixed_prefix: [u8; 4],
+            suffix: u8,
+        ) -> Vec<u8> {
+            insert_event(pool, community, event, channel)
+                .await
+                .expect("insert prefix fixture");
+            let mut id = event.id.to_bytes();
+            id[..4].copy_from_slice(&fixed_prefix);
+            id[31] = suffix;
+            sqlx::query("UPDATE events SET id = $1 WHERE community_id = $2 AND id = $3")
+                .bind(&id[..])
+                .bind(community.as_uuid())
+                .bind(event.id.as_bytes())
+                .execute(pool)
+                .await
+                .expect("assign deterministic fixture prefix");
+            id.to_vec()
+        }
+
+        let first = make_event_at(9, "first", now - 10);
+        let first_id =
+            insert_with_id(&pool, community, &first, Some(accessible), fixed_prefix, 1).await;
+        let second = make_event_at(9, "second", now - 9);
+        insert_with_id(&pool, community, &second, Some(accessible), fixed_prefix, 2).await;
+        let denied_event = make_event_at(9, "denied", now - 8);
+        insert_with_id(
+            &pool,
+            community,
+            &denied_event,
+            Some(denied),
+            fixed_prefix,
+            3,
+        )
+        .await;
+        let global = make_event_at(9, "global", now - 7);
+        insert_with_id(&pool, community, &global, None, fixed_prefix, 4).await;
+        let deleted = make_event_at(9, "deleted", now - 6);
+        let deleted_id = insert_with_id(
+            &pool,
+            community,
+            &deleted,
+            Some(accessible),
+            fixed_prefix,
+            5,
+        )
+        .await;
+        sqlx::query("UPDATE events SET deleted_at = NOW() WHERE community_id = $1 AND id = $2")
+            .bind(community.as_uuid())
+            .bind(&deleted_id)
+            .execute(&pool)
+            .await
+            .expect("soft-delete prefix fixture");
+        let old = make_event_at(9, "outside cutoff", now - 31 * 24 * 60 * 60);
+        insert_with_id(&pool, community, &old, Some(accessible), fixed_prefix, 6).await;
+        let future = make_event_at(9, "inside ingest future allowance", now + 300);
+        insert_with_id(&pool, community, &future, Some(accessible), fixed_prefix, 7).await;
+
+        let mut lower = vec![0; 32];
+        lower[..4].copy_from_slice(&fixed_prefix);
+        let mut upper = lower.clone();
+        upper[3] += 1;
+        let since = chrono::DateTime::from_timestamp((now - 30 * 24 * 60 * 60) as i64, 0)
+            .expect("valid cutoff");
+        let until = chrono::DateTime::from_timestamp(now as i64, 0).expect("valid upper bound");
+        let query = EventQuery {
+            kinds: Some(vec![9]),
+            since: Some(since),
+            until: Some(until),
+            limit: Some(501),
+            channel_ids: Some(vec![accessible]),
+            channel_ids_include_global: false,
+            id_prefix_range: Some((lower, Some(upper))),
+            ..EventQuery::for_community(community)
+        };
+        let matches = query_events(&pool, &query).await.expect("prefix query");
+        assert_eq!(
+            matches.len(),
+            2,
+            "only both recent live messages in A match; a future event within the ingest allowance does not"
+        );
+
+        let mut exact_upper = first_id.clone();
+        exact_upper.push(0);
+        let exact = query_events(
+            &pool,
+            &EventQuery {
+                id_prefix_range: Some((first_id, Some(exact_upper))),
+                ..query.clone()
+            },
+        )
+        .await
+        .expect("exact ID prefix query");
+        assert_eq!(exact.len(), 1);
+
+        let none = query_events(
+            &pool,
+            &EventQuery {
+                channel_ids: Some(vec![]),
+                ..query
+            },
+        )
+        .await
+        .expect("denied-channel scope query");
+        assert!(
+            none.is_empty(),
+            "an unauthorized channel scope matches nothing"
         );
     }
 

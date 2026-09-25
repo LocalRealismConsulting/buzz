@@ -465,6 +465,227 @@ fn extract_page_offset(raw: &Value, limit: Option<i64>) -> Option<i64> {
 /// consume it (docs/bridge-channel-window.md).
 const BRIDGE_WINDOW_DEFAULT_LIMIT: u32 = 50;
 const BRIDGE_WINDOW_MAX_LIMIT: u32 = 200;
+const EVENT_ID_PREFIX_MAX_RESULTS: usize = 500;
+const EVENT_ID_PREFIX_MESSAGE_KINDS: [u32; 5] = [9, 40002, 40008, 45001, 45003];
+
+/// Parse the HTTP-only `ids_prefix` extension and replace its implicit kind
+/// scope with the server's fixed message-kind set before shared auth gates run.
+fn parse_event_id_prefix(
+    raw_filters: &[Value],
+    filters: &mut [nostr::Filter],
+) -> Result<Option<String>, &'static str> {
+    if !raw_filters
+        .iter()
+        .any(|raw| raw.get("ids_prefix").is_some())
+    {
+        return Ok(None);
+    }
+    if raw_filters.len() != 1 || filters.len() != 1 {
+        return Err("ids_prefix cannot be mixed with other filters");
+    }
+
+    let raw = &raw_filters[0];
+    let object = raw
+        .as_object()
+        .ok_or("ids_prefix filter must be an object")?;
+    if object.keys().any(|key| key != "ids_prefix" && key != "#h") {
+        return Err("ids_prefix accepts only ids_prefix and optional #h");
+    }
+    let prefix = raw
+        .get("ids_prefix")
+        .and_then(Value::as_str)
+        .ok_or("ids_prefix must be 8-64 hexadecimal characters")?
+        .to_ascii_lowercase();
+    if !(8..=64).contains(&prefix.len()) || !prefix.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err("ids_prefix must be 8-64 hexadecimal characters");
+    }
+    if let Some(channels) = raw.get("#h") {
+        let values = channels
+            .as_array()
+            .filter(|values| {
+                !values.is_empty()
+                    && values.len() <= crate::handlers::req::MAX_EXPLICIT_CHANNEL_VALUES
+            })
+            .ok_or("ids_prefix #h must be a non-empty channel array")?;
+        if values.iter().any(|value| {
+            value
+                .as_str()
+                .and_then(|channel| uuid::Uuid::parse_str(channel).ok())
+                .is_none()
+        }) {
+            return Err("ids_prefix #h must contain channel UUIDs");
+        }
+    }
+
+    filters[0].kinds = Some(
+        EVENT_ID_PREFIX_MESSAGE_KINDS
+            .iter()
+            .map(|kind| nostr::Kind::Custom(*kind as u16))
+            .collect(),
+    );
+    Ok(Some(prefix))
+}
+
+/// Produce inclusive-lower/exclusive-upper byte bounds for an even- or
+/// odd-nibble hexadecimal prefix. The database index starts with `(community_id, id)`.
+fn event_id_prefix_range(prefix: &str) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+    if !(8..=64).contains(&prefix.len()) || !prefix.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    let prefix = prefix.to_ascii_lowercase();
+    let lower = format!("{prefix}{}", "0".repeat(64 - prefix.len()));
+    let lower = hex::decode(lower).ok()?;
+    let mut digits = prefix.as_bytes().to_vec();
+    let mut incremented = false;
+    for digit in digits.iter_mut().rev() {
+        match *digit {
+            b'0'..=b'8' | b'a'..=b'e' => {
+                *digit += 1;
+                incremented = true;
+                break;
+            }
+            b'9' => {
+                *digit = b'a';
+                incremented = true;
+                break;
+            }
+            b'f' => *digit = b'0',
+            _ => return None,
+        }
+    }
+    let upper = if incremented {
+        let upper_prefix = String::from_utf8(digits).ok()?;
+        let upper = format!("{upper_prefix}{}", "0".repeat(64 - prefix.len()));
+        Some(hex::decode(upper).ok()?)
+    } else {
+        None
+    };
+    Some((lower, upper))
+}
+
+fn prefix_query_response(events: Vec<Value>, complete: bool) -> Value {
+    let ambiguous = !complete || events.len() > 1;
+    serde_json::json!({"events": events, "complete": complete, "ambiguous": ambiguous})
+}
+
+async fn query_event_id_prefix(
+    state: &AppState,
+    tenant: &TenantContext,
+    filter: &nostr::Filter,
+    prefix: &str,
+    pubkey_bytes: &[u8],
+    accessible_channels: &[uuid::Uuid],
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let channel_id = extract_channel_from_filter(filter);
+    if channel_id.is_some_and(|channel| !accessible_channels.contains(&channel)) {
+        return Ok(Json(prefix_query_response(Vec::new(), true)));
+    }
+
+    let mut query = crate::handlers::req::build_event_query_from_filter(
+        filter,
+        pubkey_bytes,
+        state,
+        tenant.community(),
+    )
+    .await;
+    crate::handlers::req::apply_channel_only_scope_to_query(
+        &mut query,
+        filter,
+        channel_id,
+        accessible_channels,
+    );
+    let now = chrono::Utc::now();
+    query.since = Some(now - chrono::Duration::days(30));
+    query.until = Some(now);
+    query.limit = Some((EVENT_ID_PREFIX_MAX_RESULTS + 1) as i64);
+    query.max_limit = query.limit;
+    query.id_prefix_range = Some(event_id_prefix_range(prefix).ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "ids_prefix must be 8-64 hexadecimal characters",
+        )
+    })?);
+
+    // This result certifies prefix uniqueness, so do not answer from a replica
+    // that may be within its configured bounded-staleness window.
+    let queried = state
+        .db
+        .query_events(&query)
+        .await
+        .map_err(|error| internal_error(&format!("event ID prefix query: {error}")))?;
+    let complete = queried.len() <= EVENT_ID_PREFIX_MAX_RESULTS;
+    let mut events = queried
+        .into_iter()
+        .filter(|event| buzz_core::filter::filters_match(std::slice::from_ref(filter), event))
+        .filter(|event| event_in_accessible_channel(event, accessible_channels))
+        .filter(|event| crate::handlers::req::event_visible_to_reader(&event.event, pubkey_bytes))
+        .map(|event| serde_json::to_value(&event.event))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| internal_error(&format!("event ID prefix serialization: {error}")))?;
+    events.truncate(EVENT_ID_PREFIX_MAX_RESULTS);
+    Ok(Json(prefix_query_response(events, complete)))
+}
+
+#[cfg(test)]
+mod event_id_prefix_tests {
+    use super::{event_id_prefix_range, parse_event_id_prefix, prefix_query_response};
+    use serde_json::{json, Value};
+
+    fn parse(raw_filters: Vec<Value>) -> Result<Option<String>, &'static str> {
+        let mut filters = raw_filters
+            .iter()
+            .map(|raw| serde_json::from_value(raw.clone()).expect("test filter parses"))
+            .collect::<Vec<nostr::Filter>>();
+        parse_event_id_prefix(&raw_filters, &mut filters)
+    }
+
+    #[test]
+    fn prefix_request_is_bounded_and_closed() {
+        assert_eq!(
+            parse(vec![json!({"ids_prefix":"a1b2c3d4"})]).unwrap(),
+            Some("a1b2c3d4".into())
+        );
+        assert!(parse(vec![json!({"ids_prefix":"a1b2c3d"})]).is_err());
+        assert!(parse(vec![json!({"ids_prefix":"a1b2c3dg"})]).is_err());
+        assert!(parse(vec![json!({
+            "ids_prefix":"a1b2c3d4",
+            "ids":["a".repeat(64)]
+        })])
+        .is_err());
+        assert!(parse(vec![json!({"ids_prefix":"a1b2c3d4"}), json!({})]).is_err());
+    }
+
+    #[test]
+    fn byte_ranges_cover_even_odd_and_full_ids() {
+        let (lower, upper) = event_id_prefix_range("123456789").expect("valid odd prefix");
+        assert_eq!(hex::encode(lower), format!("123456789{}", "0".repeat(55)));
+        assert_eq!(
+            hex::encode(upper.expect("upper bound")),
+            format!("12345678a{}", "0".repeat(55))
+        );
+
+        let (lower, upper) = event_id_prefix_range(&"f".repeat(64)).expect("valid full prefix");
+        assert_eq!(hex::encode(lower), "f".repeat(64));
+        assert!(upper.is_none());
+    }
+
+    #[test]
+    fn result_marks_zero_one_many_and_capped_matches() {
+        let empty = prefix_query_response(vec![], true);
+        assert_eq!(empty["complete"], true);
+        assert_eq!(empty["ambiguous"], false);
+
+        let one = prefix_query_response(vec![json!({"id":"a"})], true);
+        assert_eq!(one["ambiguous"], false);
+
+        let many = prefix_query_response(vec![json!({"id":"a"}), json!({"id":"b"})], true);
+        assert_eq!(many["ambiguous"], true);
+
+        let capped = prefix_query_response(vec![json!({"id":"a"})], false);
+        assert_eq!(capped["complete"], false);
+        assert_eq!(capped["ambiguous"], true);
+    }
+}
 
 /// Aux closure kinds: reactions, deletions (NIP-09 + NIP-29), edits.
 const WINDOW_AUX_KINDS: [u32; 4] = [
@@ -1193,11 +1414,13 @@ async fn query_events_authed(
     let raw_filters: Vec<Value> = serde_json::from_slice(body)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
     let thread_windows = thread_window::parse(&raw_filters)?;
-    let filters: Vec<nostr::Filter> = raw_filters
+    let mut filters: Vec<nostr::Filter> = raw_filters
         .iter()
         .map(|v| serde_json::from_value(v.clone()))
         .collect::<Result<_, _>>()
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
+    let id_prefix = parse_event_id_prefix(&raw_filters, &mut filters)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     crate::handlers::req::extract_channel_ids_from_filters_limited(&filters)
         .map_err(|()| api_error(StatusCode::BAD_REQUEST, "too many explicit channels"))?;
 
@@ -1260,6 +1483,18 @@ async fn query_events_authed(
         &mut accessible_channels,
     )
     .await?;
+
+    if let Some(prefix) = id_prefix {
+        return query_event_id_prefix(
+            state,
+            tenant,
+            &filters[0],
+            &prefix,
+            &pubkey_bytes,
+            &accessible_channels,
+        )
+        .await;
+    }
 
     if filters.iter().any(|f| f.search.is_some()) {
         if has_mixed_search_filters(&filters) {

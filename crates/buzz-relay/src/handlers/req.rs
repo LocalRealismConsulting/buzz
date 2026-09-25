@@ -945,7 +945,7 @@ fn extract_channel_id_from_filter(filter: &Filter) -> Option<uuid::Uuid> {
 ///
 /// Each filter is queried independently so that per-filter `limit` and time
 /// windows are respected. Results are deduplicated by event ID in the caller.
-fn filter_to_query_params(
+pub(crate) fn filter_to_query_params(
     filter: &Filter,
     channel_id: Option<uuid::Uuid>,
     community: buzz_core::tenant::CommunityId,
@@ -1103,6 +1103,18 @@ pub(crate) fn apply_channel_scope_to_query(
     } else {
         query.channel_ids = Some(accessible_channels.to_vec());
     }
+}
+
+/// Apply the reader's channel scope while excluding channel-less global rows.
+/// Event-ID-prefix resolution is intentionally bounded to readable channels.
+pub(crate) fn apply_channel_only_scope_to_query(
+    query: &mut EventQuery,
+    filter: &Filter,
+    channel_id: Option<uuid::Uuid>,
+    accessible_channels: &[uuid::Uuid],
+) {
+    apply_channel_scope_to_query(query, filter, channel_id, accessible_channels);
+    query.channel_ids_include_global = false;
 }
 
 /// Extract the complete channel set when every filter is explicitly #h-scoped.
@@ -1984,6 +1996,26 @@ mod tests {
 
         assert_eq!(query.channel_id, None);
         assert_eq!(query.channel_ids, Some(vec![authorized]));
+        assert!(!query.channel_ids_include_global);
+    }
+
+    #[test]
+    fn channel_only_scope_excludes_global_and_denied_channels() {
+        let allowed = uuid::Uuid::new_v4();
+        let denied = uuid::Uuid::new_v4();
+        let filter: Filter = serde_json::from_value(serde_json::json!({
+            "#h": [allowed.to_string(), denied.to_string()],
+        }))
+        .expect("filter parses");
+        let mut query = filter_to_query_params(
+            &filter,
+            extract_channel_id_from_filter(&filter),
+            buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil()),
+        );
+
+        apply_channel_only_scope_to_query(&mut query, &filter, None, &[allowed]);
+
+        assert_eq!(query.channel_ids, Some(vec![allowed]));
         assert!(!query.channel_ids_include_global);
     }
 
