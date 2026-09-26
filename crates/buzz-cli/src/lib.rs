@@ -540,6 +540,15 @@ pub enum MessagesCmd {
         #[arg(long)]
         depth_limit: Option<u32>,
     },
+    /// Resolve an event ID prefix across channels the current identity can read
+    Resolve {
+        /// Event ID prefix (8-64 hexadecimal characters)
+        #[arg(long)]
+        prefix: String,
+        /// Restrict lookup to this channel UUID
+        #[arg(long)]
+        channel: Option<String>,
+    },
     /// Full-text search across messages
     #[command(
         after_help = "Examples:\n  buzz messages search --query checkout\n  buzz messages search --author npub1... --since 1783497600\n  buzz messages search --author Aaron --query checkout --limit 20"

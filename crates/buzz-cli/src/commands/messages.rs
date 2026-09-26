@@ -511,6 +511,52 @@ pub async fn cmd_search(
     Ok(())
 }
 
+fn event_id_prefix_filter(
+    prefix: &str,
+    channel: Option<&str>,
+) -> Result<serde_json::Value, CliError> {
+    let prefix = prefix.trim();
+    if !(8..=64).contains(&prefix.len()) || !prefix.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(CliError::Usage(
+            "event ID prefix must be 8-64 hexadecimal characters".into(),
+        ));
+    }
+    let mut filter = serde_json::json!({"ids_prefix": prefix.to_ascii_lowercase()});
+    if let Some(channel) = channel {
+        validate_uuid(channel)?;
+        filter["#h"] = serde_json::json!([channel]);
+    }
+    Ok(filter)
+}
+
+pub async fn cmd_resolve_messages(
+    client: &BuzzClient,
+    prefix: &str,
+    channel: Option<&str>,
+) -> Result<(), CliError> {
+    let filter = event_id_prefix_filter(prefix, channel)?;
+    let raw = client.query(&filter).await?;
+    let result: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
+        CliError::Other(format!("failed to parse prefix query response: {error}"))
+    })?;
+    if !result
+        .get("events")
+        .is_some_and(serde_json::Value::is_array)
+        || !result
+            .get("complete")
+            .is_some_and(serde_json::Value::is_boolean)
+        || !result
+            .get("ambiguous")
+            .is_some_and(serde_json::Value::is_boolean)
+    {
+        return Err(CliError::Other(
+            "prefix query response is missing events, complete, or ambiguous".into(),
+        ));
+    }
+    println!("{result}");
+    Ok(())
+}
+
 /// Resolve an `--author` value to a 64-char hex pubkey.
 ///
 /// Accepts, in order of precedence: 64-char hex (validated), an `npub1…`
@@ -1059,6 +1105,9 @@ pub async fn dispatch(
             )
             .await
         }
+        MessagesCmd::Resolve { prefix, channel } => {
+            cmd_resolve_messages(client, &prefix, channel.as_deref()).await
+        }
         MessagesCmd::Search {
             query,
             author,
@@ -1084,9 +1133,9 @@ pub async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        channel_id_from_event, cmd_get_thread, cmd_send_message, event_mention_pubkeys,
-        find_root_from_tags, format_events, match_profiles_by_name, merge_message_mentions,
-        missing_members, normalize_explicit_mentions, parse_member_pubkeys,
+        channel_id_from_event, cmd_get_thread, cmd_send_message, event_id_prefix_filter,
+        event_mention_pubkeys, find_root_from_tags, format_events, match_profiles_by_name,
+        merge_message_mentions, missing_members, normalize_explicit_mentions, parse_member_pubkeys,
         resolve_names_to_pubkeys, resolve_thread_target, thread_ref_from_event,
         thread_ref_from_parent_tags, BuzzClient, CliError, Uuid,
     };
@@ -1105,6 +1154,24 @@ mod tests {
     const PK_VALID_A: &str = "35c18ae273fccfaf80d629e20e7f8721b90499379addff533054acc2504c12b4";
     const PK_VALID_B: &str = "c6237ef84fa537c78dcee78efd2d4e59f728859c7f194da42ac51ededfa0be05";
     const PK_VALID_C: &str = "f4a42a97e594b77bdbd8ee35191c8b28a94a4cb871d96f32921558275421fb68";
+
+    #[test]
+    fn prefix_filter_validates_and_scopes_without_changing_lookup_shape() {
+        assert_eq!(
+            event_id_prefix_filter("A1B2C3D4", None).expect("valid prefix"),
+            json!({"ids_prefix":"a1b2c3d4"})
+        );
+        assert_eq!(
+            event_id_prefix_filter("a1b2c3d4", Some("00000000-0000-0000-0000-000000000001"))
+                .expect("valid channel"),
+            json!({
+                "ids_prefix":"a1b2c3d4",
+                "#h":["00000000-0000-0000-0000-000000000001"]
+            })
+        );
+        assert!(event_id_prefix_filter("a1b2c3d", None).is_err());
+        assert!(event_id_prefix_filter("a1b2c3dg", None).is_err());
+    }
 
     #[test]
     fn compact_event_format_remains_the_three_key_contract() {
