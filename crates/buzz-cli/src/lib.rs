@@ -519,6 +519,18 @@ pub enum MessagesCmd {
         #[arg(long)]
         kinds: Option<String>,
     },
+    /// Find message metadata in a bounded channel window (never returns bodies)
+    FindWindow {
+        /// Exact channel UUID
+        #[arg(long)]
+        channel: String,
+        /// Inclusive UTC Unix timestamp in seconds
+        #[arg(long)]
+        since: i64,
+        /// Inclusive UTC Unix timestamp in seconds
+        #[arg(long)]
+        before: i64,
+    },
     /// Get the containing thread for a message or Buzz message link
     #[command(
         after_help = "Examples:\n  buzz messages thread --channel <UUID> --event <EVENT_ID>\n  buzz messages thread --link 'buzz://message?channel=<UUID>&id=<EVENT_ID>&thread=<ROOT_ID>'"
