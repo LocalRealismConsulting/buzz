@@ -394,6 +394,102 @@ pub async fn cmd_get_messages(
     Ok(())
 }
 
+const FIND_WINDOW_MAX_SECONDS: i64 = 15 * 60;
+const FIND_WINDOW_MAX_EVENTS: u32 = 200;
+
+fn find_window_filter(
+    channel_id: &str,
+    since: i64,
+    before: i64,
+) -> Result<serde_json::Value, CliError> {
+    let normalized_channel = parse_uuid(channel_id)?.to_string();
+    if since < 0 || before < since || before - since > FIND_WINDOW_MAX_SECONDS {
+        return Err(CliError::Usage(
+            "find-window requires non-negative UTC Unix-second bounds in order and at most 15 minutes apart".into(),
+        ));
+    }
+    Ok(serde_json::json!({
+        "kinds": [9, 40002, 40008, 45001, 45003],
+        "#h": [normalized_channel],
+        "since": since,
+        "until": before,
+        "limit": FIND_WINDOW_MAX_EVENTS
+    }))
+}
+
+fn find_window_metadata(
+    expected_channel: Uuid,
+    since: i64,
+    before: i64,
+    event: &serde_json::Value,
+) -> Result<serde_json::Value, CliError> {
+    let event_id = event
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| CliError::Other("event missing string id".into()))?;
+    let event_id_parsed = parse_event_id(event_id)?;
+    let actual_channel = channel_id_from_event(event_id, event)?;
+    if actual_channel != expected_channel {
+        return Err(CliError::Other(format!(
+            "event {event_id} is outside the requested channel"
+        )));
+    }
+    let created_at = event
+        .get("created_at")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| CliError::Other(format!("event {event_id} has invalid created_at")))?;
+    if created_at < since || created_at > before {
+        return Err(CliError::Other(format!(
+            "event {event_id} is outside the requested time window"
+        )));
+    }
+    let author = event
+        .get("pubkey")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| CliError::Other(format!("event {event_id} has invalid pubkey")))?;
+    let kind = event
+        .get("kind")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| CliError::Other(format!("event {event_id} has invalid kind")))?;
+    let root = thread_ref_from_event(event_id, event)?
+        .root_event_id
+        .to_hex();
+
+    Ok(serde_json::json!({
+        "event_id": event_id_parsed.to_hex(),
+        "time_unix_seconds": created_at,
+        "author": author.to_ascii_lowercase(),
+        "kind": kind,
+        "thread_root": root,
+    }))
+}
+
+pub async fn cmd_find_window(
+    client: &BuzzClient,
+    channel_id: &str,
+    since: i64,
+    before: i64,
+) -> Result<(), CliError> {
+    let filter = find_window_filter(channel_id, since, before)?;
+    let expected_channel = parse_uuid(channel_id)?;
+    let events = client
+        .query_all_bounded(filter, FIND_WINDOW_MAX_EVENTS)
+        .await?;
+    let mut metadata = Vec::with_capacity(events.len());
+    for event in &events {
+        metadata.push(find_window_metadata(
+            expected_channel,
+            since,
+            before,
+            event,
+        )?);
+    }
+    metadata.sort_by_key(|item| item["time_unix_seconds"].as_i64().unwrap_or(0));
+    println!("{}", serde_json::Value::Array(metadata));
+    Ok(())
+}
+
 pub fn resolve_thread_target(
     expected_channel_id: Uuid,
     event_id: &str,
@@ -1073,6 +1169,11 @@ pub async fn dispatch(
             )
             .await
         }
+        MessagesCmd::FindWindow {
+            channel,
+            since,
+            before,
+        } => cmd_find_window(client, &channel, since, before).await,
         MessagesCmd::Thread {
             channel,
             event,
@@ -1133,9 +1234,10 @@ pub async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        channel_id_from_event, cmd_get_thread, cmd_send_message, event_id_prefix_filter,
-        event_mention_pubkeys, find_root_from_tags, format_events, match_profiles_by_name,
-        merge_message_mentions, missing_members, normalize_explicit_mentions, parse_member_pubkeys,
+        channel_id_from_event, cmd_find_window, cmd_get_thread, cmd_send_message,
+        event_id_prefix_filter, event_mention_pubkeys, find_root_from_tags, find_window_filter,
+        find_window_metadata, format_events, match_profiles_by_name, merge_message_mentions,
+        missing_members, normalize_explicit_mentions, parse_member_pubkeys,
         resolve_names_to_pubkeys, resolve_thread_target, thread_ref_from_event,
         thread_ref_from_parent_tags, BuzzClient, CliError, Uuid,
     };
@@ -1147,7 +1249,84 @@ mod tests {
 
     const ID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const ID_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const ID_C: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
     const PUBKEY: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const CHANNEL_A: &str = "00000000-0000-0000-0000-000000000001";
+    const CHANNEL_B: &str = "00000000-0000-0000-0000-000000000002";
+
+    #[test]
+    fn find_window_filter_is_exact_and_time_bounded() {
+        assert_eq!(
+            find_window_filter(CHANNEL_A, 100, 160).unwrap(),
+            json!({
+                "kinds": [9, 40002, 40008, 45001, 45003],
+                "#h": [CHANNEL_A],
+                "since": 100,
+                "until": 160,
+                "limit": 200,
+            })
+        );
+        assert!(find_window_filter("not-a-uuid", 100, 160).is_err());
+        assert!(find_window_filter(CHANNEL_A, 160, 100).is_err());
+        assert!(find_window_filter(CHANNEL_A, -1, 100).is_err());
+        assert!(find_window_filter(CHANNEL_A, 0, 901).is_err());
+    }
+
+    #[test]
+    fn find_window_projects_metadata_only_and_resolves_thread_root() {
+        let channel = Uuid::parse_str(CHANNEL_A).unwrap();
+        let event = json!({
+            "id": ID_B,
+            "pubkey": PUBKEY,
+            "kind": 9,
+            "created_at": 120,
+            "content": "PRIVATE BODY MUST NOT ESCAPE",
+            "tags": [["h", CHANNEL_A], ["e", ID_A, "", "root"], ["e", ID_C, "", "reply"]],
+            "sig": "d".repeat(128),
+        });
+
+        let metadata = find_window_metadata(channel, 100, 160, &event).unwrap();
+        assert_eq!(
+            metadata,
+            json!({
+                "event_id": ID_B,
+                "time_unix_seconds": 120,
+                "author": PUBKEY,
+                "kind": 9,
+                "thread_root": ID_A,
+            })
+        );
+        let serialized = metadata.to_string();
+        assert!(!serialized.contains("content"));
+        assert!(!serialized.contains("PRIVATE BODY"));
+        assert_eq!(metadata.as_object().unwrap().len(), 5);
+        assert!(find_window_metadata(channel, 121, 160, &event).is_err());
+    }
+
+    #[test]
+    fn find_window_rejects_events_returned_for_another_channel() {
+        let event = json!({
+            "id": ID_A,
+            "pubkey": PUBKEY,
+            "kind": 9,
+            "created_at": 120,
+            "content": "must not be included",
+            "tags": [["h", CHANNEL_B]],
+        });
+        assert!(
+            find_window_metadata(Uuid::parse_str(CHANNEL_A).unwrap(), 100, 160, &event).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn find_window_rejects_invalid_bounds_before_fetching() {
+        let client =
+            BuzzClient::new("http://127.0.0.1:1".into(), Keys::generate(), None, None).unwrap();
+        let error = cmd_find_window(&client, CHANNEL_A, 100, 1_001)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CliError::Usage(_)));
+    }
 
     // Three real pubkeys (lowercase 64-char hex) used by parse_member_pubkeys tests.
     // See the test's own comment on what `PublicKey::from_hex` actually validates.
